@@ -1,7 +1,6 @@
 require('dotenv').config();
 
 const AWS = require('aws-sdk');
-const axios = require('axios');
 const mysql = require('mysql2/promise');
 const crypto = require('crypto');
 
@@ -10,6 +9,7 @@ AWS.config.update({
 });
 
 const sqs = new AWS.SQS();
+const sns = new AWS.SNS();
 
 const dbPool = mysql.createPool({
     host: process.env.DB_HOST,
@@ -21,8 +21,7 @@ const dbPool = mysql.createPool({
 });
 
 const QUEUE_URL = process.env.PAYMENT_REQUESTED_QUEUE_URL;
-const ORDER_SERVICE_URL = (process.env.ORDER_SERVICE_URL || '').replace(/\/$/, '');
-const INTERNAL_API_KEY = process.env.INTERNAL_API_KEY;
+const PAYMENT_RESULT_TOPIC_ARN = process.env.PAYMENT_RESULT_TOPIC_ARN;
 
 const PAYMENT_SUCCESS_LIMIT = 1000000;
 
@@ -31,13 +30,8 @@ if (!QUEUE_URL) {
     process.exit(1);
 }
 
-if (!ORDER_SERVICE_URL) {
-    console.error('Thiếu ORDER_SERVICE_URL trong .env');
-    process.exit(1);
-}
-
-if (!INTERNAL_API_KEY) {
-    console.error('Thiếu INTERNAL_API_KEY trong .env');
+if (!PAYMENT_RESULT_TOPIC_ARN) {
+    console.error('Thiếu PAYMENT_RESULT_TOPIC_ARN trong .env');
     process.exit(1);
 }
 
@@ -48,13 +42,10 @@ function sleep(ms) {
 function parseSqsMessageBody(body) {
     const parsed = JSON.parse(body);
 
-    // Nếu subscription đã bật RawMessageDelivery=true,
     if (parsed.eventType) {
         return parsed;
     }
 
-    // Nếu chưa bật RawMessageDelivery,
-    // SNS sẽ bọc event trong field Message.
     if (parsed.Message) {
         return JSON.parse(parsed.Message);
     }
@@ -102,7 +93,8 @@ function validatePaymentRequestedEvent(event) {
         amount,
         currency: event.currency || 'VND',
         paymentMethodId: event.paymentMethod?.paymentMethodId || null,
-        paymentMethodType: methodType
+        paymentMethodType: methodType,
+        paymentMethodDisplayName: event.paymentMethod?.displayName || null
     };
 }
 
@@ -112,6 +104,11 @@ async function getExistingTransaction(orderId) {
         SELECT
             payment_transaction_id,
             order_id,
+            user_id,
+            amount,
+            currency,
+            payment_method_id,
+            payment_method_type,
             payment_status,
             failure_reason
         FROM payment_transactions
@@ -167,31 +164,23 @@ async function savePaymentTransaction({
     );
 }
 
-async function updateOrderPaymentResult({
-    orderId,
-    paymentStatus,
-    paymentTransactionId,
-    paymentError
-}) {
-    const url = `${ORDER_SERVICE_URL}/api/orders/internal/${orderId}/payment-result`;
-
-    const response = await axios.put(
-        url,
-        {
-            paymentStatus,
-            paymentTransactionId,
-            paymentError
-        },
-        {
-            headers: {
-                'Content-Type': 'application/json',
-                'x-internal-api-key': INTERNAL_API_KEY
+async function publishPaymentResult(paymentResultEvent) {
+    const result = await sns.publish({
+        TopicArn: PAYMENT_RESULT_TOPIC_ARN,
+        Message: JSON.stringify(paymentResultEvent),
+        MessageAttributes: {
+            eventType: {
+                DataType: 'String',
+                StringValue: 'PaymentResult'
             },
-            timeout: 7000
+            paymentStatus: {
+                DataType: 'String',
+                StringValue: paymentResultEvent.paymentStatus
+            }
         }
-    );
+    }).promise();
 
-    return response.data;
+    return result.MessageId;
 }
 
 async function deleteMessage(receiptHandle) {
@@ -211,11 +200,31 @@ async function processPaymentRequested(event) {
             `[SKIP] Order ${paymentRequest.orderId} đã có transaction ${existingTransaction.payment_transaction_id} với status ${existingTransaction.payment_status}`
         );
 
+        const paymentResultEvent = {
+            eventType: 'PaymentResult',
+            eventVersion: '1.0',
+            orderId: Number(existingTransaction.order_id),
+            userId: existingTransaction.user_id,
+            paymentStatus: existingTransaction.payment_status,
+            paymentTransactionId: existingTransaction.payment_transaction_id,
+            paymentError: existingTransaction.failure_reason,
+            amount: Number(existingTransaction.amount),
+            currency: existingTransaction.currency || 'VND',
+            paymentMethod: {
+                paymentMethodId: existingTransaction.payment_method_id,
+                methodType: existingTransaction.payment_method_type
+            },
+            processedAt: new Date().toISOString(),
+            duplicated: true
+        };
+
+        const messageId = await publishPaymentResult(paymentResultEvent);
+
         return {
             skipped: true,
             paymentStatus: existingTransaction.payment_status,
             paymentTransactionId: existingTransaction.payment_transaction_id,
-            paymentError: existingTransaction.failure_reason
+            paymentResultMessageId: messageId
         };
     }
 
@@ -233,8 +242,8 @@ async function processPaymentRequested(event) {
         `[PROCESS] orderId=${paymentRequest.orderId}, amount=${paymentRequest.amount}, method=${paymentRequest.paymentMethodType}, result=${paymentStatus}`
     );
 
-    // Giả lập thời gian gọi cổng thanh toán
-    await sleep(1000);
+    // Giả lập thời gian xử lý thanh toán
+    await sleep(3000);
 
     await savePaymentTransaction({
         paymentTransactionId,
@@ -249,18 +258,32 @@ async function processPaymentRequested(event) {
         rawEvent: event
     });
 
-    await updateOrderPaymentResult({
+    const paymentResultEvent = {
+        eventType: 'PaymentResult',
+        eventVersion: '1.0',
         orderId: paymentRequest.orderId,
+        userId: paymentRequest.userId,
         paymentStatus,
         paymentTransactionId,
-        paymentError: failureReason
-    });
+        paymentError: failureReason,
+        amount: paymentRequest.amount,
+        currency: paymentRequest.currency,
+        paymentMethod: {
+            paymentMethodId: paymentRequest.paymentMethodId,
+            methodType: paymentRequest.paymentMethodType,
+            displayName: paymentRequest.paymentMethodDisplayName
+        },
+        processedAt: new Date().toISOString()
+    };
+
+    const paymentResultMessageId = await publishPaymentResult(paymentResultEvent);
 
     return {
         skipped: false,
         paymentStatus,
         paymentTransactionId,
-        paymentError: failureReason
+        paymentError: failureReason,
+        paymentResultMessageId
     };
 }
 
@@ -274,24 +297,24 @@ async function processMessage(message) {
 
         const result = await processPaymentRequested(event);
 
-        console.log('[DONE] Payment result:', result);
+        console.log('[DONE] Payment result published:', result);
 
         await deleteMessage(receiptHandle);
 
-        console.log('[DELETE] SQS message deleted.');
+        console.log('[DELETE] SQS payment-requested message deleted.');
 
     } catch (error) {
-        console.error('[ERROR] Không thể xử lý message:', error.response?.data || error.message);
+        console.error('[ERROR] Không thể xử lý message:', error.message);
 
         // Không delete message nếu lỗi kỹ thuật.
-        // SQS sẽ cho retry sau VisibilityTimeout.
-        // Sau này có thể cấu hình DLQ để tránh retry vô hạn.
+        // SQS sẽ retry sau VisibilityTimeout.
     }
 }
 
 async function pollMessages() {
     console.log('Payment worker started.');
     console.log(`Listening queue: ${QUEUE_URL}`);
+    console.log(`Publishing result topic: ${PAYMENT_RESULT_TOPIC_ARN}`);
     console.log(`Success rule: amount <= ${PAYMENT_SUCCESS_LIMIT}`);
     console.log(`Fail rule: amount > ${PAYMENT_SUCCESS_LIMIT}`);
 
@@ -324,13 +347,13 @@ async function pollMessages() {
 }
 
 process.on('SIGINT', async () => {
-    console.log('Worker received SIGINT. Exiting...');
+    console.log('Payment worker received SIGINT. Exiting...');
     await dbPool.end();
     process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-    console.log('Worker received SIGTERM. Exiting...');
+    console.log('Payment worker received SIGTERM. Exiting...');
     await dbPool.end();
     process.exit(0);
 });
